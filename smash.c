@@ -212,9 +212,9 @@ int tokstream_error(tokstream *ts, int err) {
 }
 
 /**
- * Token_init adds `lexeme` to the symbol table and populates `tok` size, lexeme
- * (a pointer into the symbol table), and type. If overflow occurs, it returns
- * an error code and tok->lexeme is set to NULL.
+ * Add `lexeme` to the symbol table and populate `tok` size, lexeme
+ * (a pointer into the symbol table), and type. If overflow occurs, return
+ * an error code and set tok->lexeme to NULL.
  */
 int token_init(tokstream *ts, token *tok, int type, char *lexeme, int len) {
     tok->lexeme = ts->symtable.charbuf + ts->symtable.pos;
@@ -236,8 +236,8 @@ int token_init(tokstream *ts, token *tok, int type, char *lexeme, int len) {
 }
 
 /**
- * Tokstream_init initializes a tokstream's symbol table with keywords and
- * symbols, gives it an input to parse, and resets the state of the lexer.
+ * Initialize a tokstream's symbol table with keywords and
+ * symbols, give it an input to parse, and reset the state of the lexer.
  */
 int tokstream_init(tokstream *ts, char *input) {
 
@@ -274,7 +274,7 @@ int tokstream_init(tokstream *ts, char *input) {
 }
 
 /**
- * Tokstream_next parses ts's input and assigns tok to the next token in the
+ * Parse ts's input and assigns tok to the next token in the
  * stream.
  */
 int tokstream_next(tokstream *ts, token *tok) {
@@ -406,6 +406,11 @@ int tokstream_next(tokstream *ts, token *tok) {
     return err;
 }
 
+/**
+ * Command represents a shell directive. It stores a directive's pid, argument
+ * list, any redirection information, and whether the process is to be executed
+ * in the background.
+ */
 typedef struct command {
     int background;
     unsigned int pid;
@@ -420,20 +425,12 @@ typedef struct command {
 
 int command_init(command *c, int type) {
     c->type = type;
-
     c->in = NULL;
     c->out = NULL;
-
     c->argc = 0;
-
     c->background = 0;
     c->pid = 0;
-
     return ERR_SUCCESS;
-}
-
-void command_delete(command *c) {
-    free(c);
 }
 
 char *builtins[] = {"cd", "exit"};
@@ -547,6 +544,10 @@ int parse_command(command *c, tokstream *ts, token *tok) {
     return parse_redirects(c, ts, tok);
 }
 
+/**
+ * Parse input into a command object. If something goes wrong, it
+ * returns an error code. Otherwise, it returns ERR_SUCCESS.
+ */
 int parse(command *c, char *input) {
     tokstream ts;
     token tok;
@@ -637,38 +638,6 @@ int exec_standard(command *c) {
     return errno;
 }
 
-void command_debug(command *c, int space);
-
-int run(char *input) {
-    command c;
-    int err, pid;
-
-    err = parse(&c, input);
-    if (err != 0) {
-        return err;
-    }
-    /* command_debug(&c, 0); */
-
-    if (c.type == COMTYPE_BUILTIN) {
-        return exec_builtin(&c);
-    }
-
-    pid = fork();
-    if (pid < 0) {
-        fprintf(stderr, "error forking process\n");
-        exit(1);
-    }
-
-    if (pid == 0) {
-        exit(exec_standard(&c));
-    }
-
-    c.pid = pid;
-    waitpid(c.pid, 0, 0);
-
-    return ERR_SUCCESS;
-}
-
 void print_space(int n) {
     for (int i = 0; i < n; ++i) {
         printf(" ");
@@ -736,6 +705,35 @@ void command_debug(command *c, int space) {
 
     print_space(space);
     printf("}\n");
+}
+
+int run(char *input) {
+    command c;
+    int err, pid;
+
+    err = parse(&c, input);
+    if (err != 0) {
+        return err;
+    }
+
+    if (c.type == COMTYPE_BUILTIN) {
+        return exec_builtin(&c);
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "error forking process\n");
+        exit(1);
+    }
+
+    if (pid == 0) {
+        exit(exec_standard(&c));
+    }
+
+    c.pid = pid;
+    waitpid(c.pid, 0, 0);
+
+    return ERR_SUCCESS;
 }
 
 int main() {
