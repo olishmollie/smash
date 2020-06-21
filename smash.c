@@ -5,27 +5,27 @@
 #include <string.h>
 #include <sys/fcntl.h>
 #include <sys/param.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <readline/history.h>
 #include <readline/readline.h>
 
 #define EOS '\0'
-#define MAXCHAR 1024
+#define MAXCHAR 65536
 #define MAXARGS 1024
-
-/* Charbuf stores the characters used in token charbuf. */
-char charbuf[MAXCHAR];
-
-/* OLDPWD stores the previously visited directory . */
-char OLDPWD[MAXPATHLEN];
+#define MAXCOMMAND 256
 
 typedef enum error {
     ERR_SUCCESS,
     ERR_UNEXPECTED_CHAR,
     ERR_UNEXPECTED_TOKEN,
-    ERR_TOO_MANY_ARGS,
-    ERR_SYMBOL_TABLE_OVERFLOW
+    ERR_ARGLIST_OVERFLOW,
+    ERR_SYMTABLE_OVERFLOW,
+    ERR_COMLIST_OVERFLOW,
+    ERR_COMLIST_UNDERFLOW,
+    ERR_FORK_ERROR,
+    ERR_IO_ERROR
 } error;
 
 typedef struct token {
@@ -55,6 +55,55 @@ typedef struct token {
     char *lexeme;
     unsigned int row, col, size;
 } token;
+
+/**
+ * Tokstream represents the state of the lexer. It stores the input to be
+ * parsed, a char buffer for lexemes, and its current position.
+ */
+typedef struct tokstream {
+    struct {
+        char *charbuf;
+        unsigned int pos;
+    } symtable;
+    char *input;
+    unsigned int start, end;
+} tokstream;
+
+/**
+ * Command represents a shell directive. It stores a directive's pid, argument
+ * list, any redirection information, and whether the process is to be executed
+ * in the background.
+ */
+typedef struct command {
+    int background;
+    unsigned int pid;
+
+    enum { COMTYPE_STANDARD, COMTYPE_BUILTIN, COMTYPE_PIPE } type;
+
+    char *in, *out;
+
+    unsigned int argc;
+    char *argv[MAXARGS];
+} command;
+
+/**
+ *Charbuf stores the characters used in token charbuf.
+ */
+char charbuf[MAXCHAR];
+
+/**
+ * OLDPWD stores the previously visited directory .
+ */
+char OLDPWD[MAXPATHLEN];
+
+/**
+ * Comlist stores background processes that the shell periodically monitors for
+ * completion.
+ */
+typedef struct comlist {
+    command commands[MAXCOMMAND];
+    unsigned int pos;
+} comlist;
 
 /* Global tokens */
 token tok_dlr;
@@ -90,19 +139,6 @@ void token_debug(token *tok) {
     char *name = toknames[tok->type];
     printf("{ type: %s, lexeme: '%s' }\n", name, tok->lexeme);
 }
-
-/**
- * Tokstream represents the state of the lexer. It stores the input to be
- * parsed, a char buffer for lexemes, and its current position.
- */
-typedef struct tokstream {
-    struct {
-        char *charbuf;
-        unsigned int pos;
-    } symtable;
-    char *input;
-    unsigned int start, end;
-} tokstream;
 
 int is_space(unsigned int c) {
     switch (c) {
@@ -201,7 +237,7 @@ int tokstream_error(tokstream *ts, int err) {
         fprintf(stderr, "read error: unexpected token '%c%s'\n", c,
                 c ? "" : "EOF");
         break;
-    case ERR_SYMBOL_TABLE_OVERFLOW:
+    case ERR_SYMTABLE_OVERFLOW:
         fprintf(stderr, "read error: symbol table overflow\n");
         break;
     default:
@@ -224,7 +260,7 @@ int token_init(tokstream *ts, token *tok, int type, char *lexeme, int len) {
     for (int i = 0; i < len; ++i) {
         if (ts->symtable.pos >= MAXCHAR) {
             tok->lexeme = NULL;
-            return tokstream_error(ts, ERR_SYMBOL_TABLE_OVERFLOW);
+            return tokstream_error(ts, ERR_SYMTABLE_OVERFLOW);
         }
 
         ts->symtable.charbuf[ts->symtable.pos++] = *lexeme++;
@@ -406,33 +442,6 @@ int tokstream_next(tokstream *ts, token *tok) {
     return err;
 }
 
-/**
- * Command represents a shell directive. It stores a directive's pid, argument
- * list, any redirection information, and whether the process is to be executed
- * in the background.
- */
-typedef struct command {
-    int background;
-    unsigned int pid;
-
-    enum { COMTYPE_STANDARD, COMTYPE_BUILTIN, COMTYPE_PIPE } type;
-
-    char *in, *out;
-
-    unsigned int argc;
-    char *argv[MAXCHAR];
-} command;
-
-int command_init(command *c, int type) {
-    c->type = type;
-    c->in = NULL;
-    c->out = NULL;
-    c->argc = 0;
-    c->background = 0;
-    c->pid = 0;
-    return ERR_SUCCESS;
-}
-
 char *builtins[] = {"cd", "exit"};
 unsigned int nbuiltins = sizeof(builtins) / sizeof(builtins[0]);
 
@@ -456,11 +465,11 @@ int parse_error(token *tok, int err) {
     case ERR_UNEXPECTED_TOKEN:
         fprintf(stderr, "parse error: unexpected token '%s'\n", tok->lexeme);
         break;
-    case ERR_TOO_MANY_ARGS:
+    case ERR_ARGLIST_OVERFLOW:
         fprintf(stderr, "parse error: too many arguments\n");
         break;
     /* These two are handled by the tokstream. */
-    case ERR_SYMBOL_TABLE_OVERFLOW:
+    case ERR_SYMTABLE_OVERFLOW:
     case ERR_UNEXPECTED_CHAR:
         break;
     default:
@@ -485,14 +494,14 @@ int parse_redirects(command *c, tokstream *ts, token *tok) {
     while (tok->type == TOKTYPE_LT || tok->type == TOKTYPE_GT) {
         if (tok->type == TOKTYPE_LT) {
             err = expect(ts, tok, TOKTYPE_SYM);
-            if (err != ERR_SUCCESS) {
+            if (err) {
                 return err;
             }
 
             c->in = tok->lexeme;
         } else {
             err = expect(ts, tok, TOKTYPE_SYM);
-            if (err != ERR_SUCCESS) {
+            if (err) {
                 return err;
             }
 
@@ -500,7 +509,7 @@ int parse_redirects(command *c, tokstream *ts, token *tok) {
         }
 
         err = tokstream_next(ts, tok);
-        if (err != ERR_SUCCESS) {
+        if (err) {
             return err;
         }
     }
@@ -511,25 +520,18 @@ int parse_redirects(command *c, tokstream *ts, token *tok) {
 int parse_command(command *c, tokstream *ts, token *tok) {
     int err;
 
-    err = command_init(c, COMTYPE_STANDARD);
-    if (err) {
-        return err;
-    }
-
     err = tokstream_next(ts, tok);
     if (err) {
         return err;
     }
 
-    if (is_builtin(tok->lexeme)) {
-        c->type = COMTYPE_BUILTIN;
-    }
+    c->type = is_builtin(tok->lexeme) ? COMTYPE_BUILTIN : COMTYPE_STANDARD;
 
+    /* Parse arguments */
     c->argv[c->argc++] = tok->lexeme;
-
     while ((err = tokstream_next(ts, tok)) == 0 && !tok_isdelim(tok)) {
         if (c->argc >= MAXARGS) {
-            return ERR_TOO_MANY_ARGS;
+            return ERR_ARGLIST_OVERFLOW;
         }
 
         c->argv[c->argc++] = tok->lexeme;
@@ -560,6 +562,11 @@ int parse(command *c, char *input) {
         return parse_error(&tok, err);
     }
 
+    /* Check for a background process */
+    if (tok.type == TOKTYPE_AMP) {
+        c->background = 1;
+    }
+
     if ((err = expect(&ts, &tok, TOKTYPE_EOF))) {
         return parse_error(&tok, err);
     }
@@ -567,21 +574,48 @@ int parse(command *c, char *input) {
     return ERR_SUCCESS;
 }
 
+int run_error(int err) {
+    switch (err) {
+    case ERR_COMLIST_OVERFLOW:
+        fprintf(stderr, "run error: commmand list overflow\n");
+        break;
+    case ERR_COMLIST_UNDERFLOW:
+        fprintf(stderr, "run error: command list underflow\n");
+        break;
+    case ERR_FORK_ERROR:
+        fprintf(stderr, "run error: problem forking process\n");
+        break;
+    case ERR_IO_ERROR:
+        fprintf(stderr, "run error: I/O problem\n");
+        break;
+    /* These are handled by the lex and parse stages. */
+    case ERR_UNEXPECTED_TOKEN:
+    case ERR_ARGLIST_OVERFLOW:
+    case ERR_SYMTABLE_OVERFLOW:
+    case ERR_UNEXPECTED_CHAR:
+        break;
+    default:
+        fprintf(stderr, "run error: unknown error code %d\n", err);
+    }
+
+    return err;
+}
+
 int exec_builtin(command *c) {
     if (strcmp(c->argv[0], "exit") == 0) {
         int arg = 0;
         if (c->argc > 1) {
-            // NOTE: not checking for errors in atoi, it might blow up.
+            /* NOTE: -- I should eventually check for errors here. */
             int arg = atoi(c->argv[1]);
         }
         exit(arg);
     }
 
     if (strcmp(c->argv[0], "cd") == 0) {
-        // Save OLDPWD into tmp var.
+        /* Save OLDPWD into tmp var. */
         getcwd(OLDPWD, MAXPATHLEN);
 
-        // Switch directories.
+        /* Switch directories. */
         if (c->argc > 1) {
             if (strcmp(c->argv[1], "-") == 0) {
                 chdir(OLDPWD);
@@ -594,29 +628,37 @@ int exec_builtin(command *c) {
     }
 
     if (strcmp(c->argv[0], "jobs") == 0) {
-        // TODO
+        /* TODO */
     }
 
     return ERR_SUCCESS;
 }
 
 int exec_standard(command *c) {
+    int ifd, ofd;
     if (c->in) {
-        // Open the destination file and rewire stdout.
-        int ifd = open(c->in, O_RDWR, 0644);
+        /* Open the destination file and rewire stdout. */
+        ifd = open(c->in, O_RDWR, 0644);
+        if (ifd < 0) {
+            return run_error(ERR_IO_ERROR);
+        }
 
         dup2(ifd, 0);
         close(ifd);
     }
 
     if (c->out) {
-        // Open the source file and rewire stdin.
-        int ofd = open(c->out, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        /* Open the source file and rewire stdin. */
+        ofd = open(c->out, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (ofd < 0) {
+            return run_error(ERR_IO_ERROR);
+        }
 
         dup2(ofd, 1);
         close(ofd);
     }
 
+    /* TODO: -- Incorporate errno into existing error handling scheme. */
     if (execvp(c->argv[0], c->argv) == -1) {
         fprintf(stderr, "%s: ", c->argv[0]);
 
@@ -707,46 +749,99 @@ void command_debug(command *c, int space) {
     printf("}\n");
 }
 
-int run(char *input) {
-    command c;
+int comlist_init(comlist *cl) {
+    cl->pos = -1;
+    return ERR_SUCCESS;
+}
+
+int comlist_next(comlist *cl, command **c) {
+    if (cl->pos + 1 >= MAXCOMMAND) {
+        return ERR_COMLIST_OVERFLOW;
+    }
+
+    *c = &cl->commands[++cl->pos];
+
+    (*c)->in = NULL;
+    (*c)->out = NULL;
+    (*c)->argc = 0;
+    (*c)->background = 0;
+    (*c)->pid = 0;
+
+    return ERR_SUCCESS;
+}
+
+int comlist_pop(comlist *cl) {
+    if (cl->pos == -1) {
+        return ERR_COMLIST_UNDERFLOW;
+    }
+
+    --cl->pos;
+
+    return ERR_SUCCESS;
+}
+
+int run(char *input, comlist *cl) {
+    command *c;
     int err, pid;
 
-    err = parse(&c, input);
-    if (err != 0) {
+    /* Clean up any finished background processes. */
+    for (int i = cl->pos; i >= 0; --i) {
+        if (waitpid(cl->commands[i].pid, 0, WNOHANG)) {
+            comlist_pop(cl);
+        }
+    }
+
+    err = comlist_next(cl, &c);
+    if (err) {
         return err;
     }
 
-    if (c.type == COMTYPE_BUILTIN) {
-        return exec_builtin(&c);
+    err = parse(c, input);
+    if (err) {
+        return err;
+    }
+
+    if (c->type == COMTYPE_BUILTIN) {
+        return exec_builtin(c);
     }
 
     pid = fork();
     if (pid < 0) {
-        fprintf(stderr, "error forking process\n");
-        exit(1);
+        return run_error(ERR_FORK_ERROR);
     }
 
     if (pid == 0) {
-        exit(exec_standard(&c));
+        exit(exec_standard(c));
     }
 
-    c.pid = pid;
-    waitpid(c.pid, 0, 0);
+    c->pid = pid;
+
+    if (!c->background) {
+        waitpid(c->pid, 0, 0);
+
+        err = comlist_pop(cl);
+        if (err) {
+            return run_error(err);
+        }
+    }
 
     return ERR_SUCCESS;
 }
 
 int main() {
     char *prompt, *input;
+    comlist cl;
+
+    comlist_init(&cl);
 
     while (1) {
-        prompt = "Smash $ ";
+        prompt = "jsh> ";
         input = readline(prompt);
 
         if (input && strlen(input) > 0) {
             add_history(input);
 
-            run(input);
+            run(input, &cl);
         }
 
         /* Exit on ^D */
@@ -754,7 +849,6 @@ int main() {
             break;
         }
 
-        // Valgrind doesn't like using delete with the c malloc from readline.
         free(input);
     }
 
