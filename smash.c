@@ -25,7 +25,8 @@ typedef enum error {
     ERR_COMLIST_OVERFLOW,
     ERR_COMLIST_UNDERFLOW,
     ERR_FORK_ERROR,
-    ERR_IO_ERROR
+    ERR_IO_ERROR,
+    ERR_PIPE_ERROR
 } error;
 
 typedef struct token {
@@ -480,6 +481,7 @@ int parse_error(token *tok, int err) {
     case ERR_SYMTABLE_OVERFLOW:
     case ERR_FORK_ERROR:
     case ERR_IO_ERROR:
+    case ERR_PIPE_ERROR:
         break;
     case ERR_UNEXPECTED_TOKEN:
         fprintf(stderr, "parse error: unexpected token '%s'\n", tok->lexeme);
@@ -541,6 +543,7 @@ int comlist_pop(comlist *cl) {
 
 int pipeline_init(pipeline *p) {
     p->size = 0;
+    p->bg = 0;
     return ERR_SUCCESS;
 }
 
@@ -667,6 +670,12 @@ int parse(comlist *cl, pipeline *p, char *input) {
 
 int run_error(int err) {
     switch (err) {
+    /* NOTE: Uncaught cases are handled by other error functions. */
+    case ERR_UNEXPECTED_TOKEN:
+    case ERR_ARGLIST_OVERFLOW:
+    case ERR_SYMTABLE_OVERFLOW:
+    case ERR_UNEXPECTED_CHAR:
+        break;
     case ERR_COMLIST_OVERFLOW:
         fprintf(stderr, "run error: commmand list overflow\n");
         break;
@@ -679,11 +688,8 @@ int run_error(int err) {
     case ERR_IO_ERROR:
         fprintf(stderr, "run error: I/O problem\n");
         break;
-    /* These are handled by the lex and parse stages. */
-    case ERR_UNEXPECTED_TOKEN:
-    case ERR_ARGLIST_OVERFLOW:
-    case ERR_SYMTABLE_OVERFLOW:
-    case ERR_UNEXPECTED_CHAR:
+    case ERR_PIPE_ERROR:
+        fprintf(stderr, "run error: problem creating pipe\n");
         break;
     default:
         fprintf(stderr, "run error: unknown error code %d\n", err);
@@ -696,8 +702,8 @@ int exec_builtin(command *c) {
     if (strcmp(c->argv[0], "exit") == 0) {
         int arg = 0;
         if (c->argc > 1) {
-            /* NOTE: -- I should eventually check for errors here. */
-            int arg = atoi(c->argv[1]);
+            /* TODO: Check for atoi errors. */
+            arg = atoi(c->argv[1]);
         }
         exit(arg);
     }
@@ -859,41 +865,70 @@ void pipeline_debug(pipeline *p, int space) {
 }
 
 int run(char *input, comlist *cl, pipeline *p) {
-    int err, pid;
-
-    /* Clean up any finished background processes. */
-    for (int i = cl->pos; i >= 0; --i) {
-        if (waitpid(cl->commands[i].pid, 0, WNOHANG)) {
-            comlist_pop(cl);
-        }
-    }
+    command *c;
+    int err, pid, stdin_cpy, pipefd[2], i;
 
     err = parse(cl, p, input);
     if (err) {
         return err;
     }
 
-    pipeline_debug(p, 0);
+    c = p->first;
 
-    /* pid = fork(); */
-    /* if (pid < 0) { */
-    /*     return run_error(ERR_FORK_ERROR); */
-    /* } */
+    /* Copy stdin for later restoration. */
+    stdin_cpy = dup(0);
 
-    /* if (pid == 0) { */
-    /*     exit(exec_standard(c)); */
-    /* } */
+    if (is_builtin(p->first->argv[0])) {
+        return exec_builtin(p->first);
+    }
 
-    /* c->pid = pid; */
+    /* TODO: Refactor. */
+    for (i = 0; i < p->size; ++i) {
+        /* Unless first, fix read end of the pipe to stdin. */
+        if (i > 0) {
+            dup2(pipefd[0], 0);
+            close(pipefd[0]);
+            close(pipefd[1]);
+        }
 
-    /* if (!c->bg) { */
-    /*     waitpid(c->pid, 0, 0); */
+        /* Unless last, create a new pipe. */
+        if (i < p->size - 1) {
+            if (pipe(pipefd) != 0) {
+                exit(run_error(ERR_PIPE_ERROR));
+            }
+        }
 
-    /*     err = comlist_pop(cl); */
-    /*     if (err) { */
-    /*         return run_error(err); */
-    /*     } */
-    /* } */
+        pid = fork();
+        if (pid < 0) {
+            exit(run_error(ERR_FORK_ERROR));
+        }
+
+        if (pid == 0) {
+            /* Unless last, fix write end of the pipe to stdout. */
+            if (i < p->size - 1) {
+                dup2(pipefd[1], 1);
+                close(pipefd[0]);
+                close(pipefd[1]);
+            }
+
+            exit(is_builtin(c->argv[0]) ? exec_builtin(c) : exec_standard(c));
+        }
+
+        c->pid = pid;
+        c++;
+    }
+
+    if (!p->bg) {
+        /* Wait for all processes in the pipeline to finish. */
+        for (i = cl->pos; i >= 0; --i) {
+            waitpid(cl->commands[i].pid, 0, 0);
+            comlist_pop(cl);
+        }
+    }
+
+    /* Restore stdin. */
+    dup2(stdin_cpy, 0);
+    close(stdin_cpy);
 
     return ERR_SUCCESS;
 }
@@ -902,11 +937,21 @@ int main() {
     char *prompt, *input;
     comlist cl;
     pipeline p;
+    int i;
 
     comlist_init(&cl);
-    pipeline_init(&p);
 
     while (1) {
+
+        pipeline_init(&p);
+
+        /* Reap any finished background processes. */
+        for (i = cl.pos; i >= 0; --i) {
+            if (waitpid(cl.commands[i].pid, 0, WNOHANG)) {
+                comlist_pop(&cl);
+            }
+        }
+
         prompt = "jsh> ";
         input = readline(prompt);
 
