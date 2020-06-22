@@ -75,16 +75,37 @@ typedef struct tokstream {
  * in the background.
  */
 typedef struct command {
-    int background;
     unsigned int pid;
 
-    enum { COMTYPE_STANDARD, COMTYPE_BUILTIN, COMTYPE_PIPE } type;
+    enum { COMTYPE_STANDARD, COMTYPE_BUILTIN } type;
 
     char *in, *out;
 
     unsigned int argc;
     char *argv[MAXARGS];
 } command;
+
+/**
+ * A pipeline represents the largest parse unit, a series of commands connected
+ * by pipes. Since every command is a pointer into the comlist, it can be
+ * concisely described by the number of connected commands and a pointer to the
+ * first such command.
+ * NOTE: size must never exceed MAXCOMMAND.
+ */
+typedef struct pipeline {
+    command *first;
+    unsigned int size;
+    int bg;
+} pipeline;
+
+/**
+ * Comlist is the memory store for commands. Every command parsed by the shell
+ * is represented by a pointer into this list.
+ */
+typedef struct comlist {
+    command commands[MAXCOMMAND];
+    unsigned int pos;
+} comlist;
 
 /**
  *Charbuf stores the characters used in token charbuf.
@@ -95,15 +116,6 @@ char charbuf[MAXCHAR];
  * OLDPWD stores the previously visited directory .
  */
 char OLDPWD[MAXPATHLEN];
-
-/**
- * Comlist stores background processes that the shell periodically monitors for
- * completion.
- */
-typedef struct comlist {
-    command commands[MAXCOMMAND];
-    unsigned int pos;
-} comlist;
 
 /* Global tokens */
 token tok_dlr;
@@ -457,20 +469,29 @@ int is_builtin(char *sym) {
 int tok_isdelim(token *tok) {
     return tok->type == TOKTYPE_DLR || tok->type == TOKTYPE_DLRPAR ||
            tok->type == TOKTYPE_GT || tok->type == TOKTYPE_LT ||
-           tok->type == TOKTYPE_AMP || tok->type == TOKTYPE_EOF;
+           tok->type == TOKTYPE_AMP || tok->type == TOKTYPE_PIPE ||
+           tok->type == TOKTYPE_EOF;
 }
 
 int parse_error(token *tok, int err) {
     switch (err) {
+    /* NOTE: Uncaught cases are handled in other error functions. */
+    case ERR_UNEXPECTED_CHAR:
+    case ERR_SYMTABLE_OVERFLOW:
+    case ERR_FORK_ERROR:
+    case ERR_IO_ERROR:
+        break;
     case ERR_UNEXPECTED_TOKEN:
         fprintf(stderr, "parse error: unexpected token '%s'\n", tok->lexeme);
         break;
     case ERR_ARGLIST_OVERFLOW:
         fprintf(stderr, "parse error: too many arguments\n");
         break;
-    /* These two are handled by the tokstream. */
-    case ERR_SYMTABLE_OVERFLOW:
-    case ERR_UNEXPECTED_CHAR:
+    case ERR_COMLIST_OVERFLOW:
+        fprintf(stderr, "parse error: command list overflow\n");
+        break;
+    case ERR_COMLIST_UNDERFLOW:
+        fprintf(stderr, "parse error: command list underflow\n");
         break;
     default:
         fprintf(stderr, "parse error: unknown error code %d\n", err);
@@ -486,6 +507,41 @@ int expect(tokstream *ts, token *tok, int toktype) {
     }
 
     return err;
+}
+
+int comlist_init(comlist *cl) {
+    cl->pos = -1;
+    return ERR_SUCCESS;
+}
+
+int comlist_next(comlist *cl, command **c) {
+    if (cl->pos + 1 >= MAXCOMMAND) {
+        return ERR_COMLIST_OVERFLOW;
+    }
+
+    *c = &cl->commands[++cl->pos];
+
+    (*c)->in = NULL;
+    (*c)->out = NULL;
+    (*c)->argc = 0;
+    (*c)->pid = 0;
+
+    return ERR_SUCCESS;
+}
+
+int comlist_pop(comlist *cl) {
+    if (cl->pos == -1) {
+        return ERR_COMLIST_UNDERFLOW;
+    }
+
+    --cl->pos;
+
+    return ERR_SUCCESS;
+}
+
+int pipeline_init(pipeline *p) {
+    p->size = 0;
+    return ERR_SUCCESS;
 }
 
 int parse_redirects(command *c, tokstream *ts, token *tok) {
@@ -546,25 +602,60 @@ int parse_command(command *c, tokstream *ts, token *tok) {
     return parse_redirects(c, ts, tok);
 }
 
+int parse_pipe(comlist *cl, pipeline *p, tokstream *ts, token *tok) {
+    command *c;
+    int err;
+
+    err = comlist_next(cl, &c);
+    if (err) {
+        return err;
+    }
+
+    p->size = 1;
+    p->first = c;
+
+    err = parse_command(c, ts, tok);
+    if (err) {
+        return err;
+    }
+
+    while (tok->type == TOKTYPE_PIPE) {
+        err = comlist_next(cl, &c);
+        if (err) {
+            return err;
+        }
+
+        err = parse_command(c, ts, tok);
+        if (err) {
+            return err;
+        }
+
+        ++p->size;
+    }
+
+    return ERR_SUCCESS;
+}
+
 /**
  * Parse input into a command object. If something goes wrong, it
  * returns an error code. Otherwise, it returns ERR_SUCCESS.
  */
-int parse(command *c, char *input) {
+int parse(comlist *cl, pipeline *p, char *input) {
     tokstream ts;
     token tok;
     int err;
 
     tokstream_init(&ts, input);
 
-    err = parse_command(c, &ts, &tok);
+    /* err = parse_command(c, &ts, &tok); */
+    err = parse_pipe(cl, p, &ts, &tok);
     if (err) {
         return parse_error(&tok, err);
     }
 
     /* Check for a background process */
     if (tok.type == TOKTYPE_AMP) {
-        c->background = 1;
+        p->bg = 1;
     }
 
     if ((err = expect(&ts, &tok, TOKTYPE_EOF))) {
@@ -712,9 +803,6 @@ void command_debug(command *c, int space) {
         print_space(space + 4);
         printf("out: %s\n", c->out);
 
-        print_space(space + 4);
-        printf("background: %s\n", c->background ? "true" : "false");
-
         break;
     case COMTYPE_BUILTIN:
         print_space(space + 4);
@@ -736,12 +824,6 @@ void command_debug(command *c, int space) {
         print_space(space + 4);
         printf("out: %s\n", c->out);
 
-        print_space(space + 4);
-        printf("background: %s\n", c->background ? "true" : "false");
-
-        break;
-    case COMTYPE_PIPE:
-        // TODO
         break;
     }
 
@@ -749,39 +831,34 @@ void command_debug(command *c, int space) {
     printf("}\n");
 }
 
-int comlist_init(comlist *cl) {
-    cl->pos = -1;
-    return ERR_SUCCESS;
-}
+void pipeline_debug(pipeline *p, int space) {
+    command *c = p->first;
 
-int comlist_next(comlist *cl, command **c) {
-    if (cl->pos + 1 >= MAXCOMMAND) {
-        return ERR_COMLIST_OVERFLOW;
+    print_space(space);
+    printf("Pipeline {\n");
+
+    print_space(space + 4);
+    printf("size: %d\n", p->size);
+
+    print_space(space + 4);
+    printf("bg: %s\n", p->bg ? "true" : "false");
+
+    print_space(space + 4);
+    printf("[\n");
+
+    int i;
+    for (i = 0; i < p->size; ++i) {
+        command_debug(c++, space + 8);
     }
 
-    *c = &cl->commands[++cl->pos];
+    print_space(space + 4);
+    printf("]\n");
 
-    (*c)->in = NULL;
-    (*c)->out = NULL;
-    (*c)->argc = 0;
-    (*c)->background = 0;
-    (*c)->pid = 0;
-
-    return ERR_SUCCESS;
+    print_space(space);
+    printf("}\n");
 }
 
-int comlist_pop(comlist *cl) {
-    if (cl->pos == -1) {
-        return ERR_COMLIST_UNDERFLOW;
-    }
-
-    --cl->pos;
-
-    return ERR_SUCCESS;
-}
-
-int run(char *input, comlist *cl) {
-    command *c;
+int run(char *input, comlist *cl, pipeline *p) {
     int err, pid;
 
     /* Clean up any finished background processes. */
@@ -791,39 +868,32 @@ int run(char *input, comlist *cl) {
         }
     }
 
-    err = comlist_next(cl, &c);
+    err = parse(cl, p, input);
     if (err) {
         return err;
     }
 
-    err = parse(c, input);
-    if (err) {
-        return err;
-    }
+    pipeline_debug(p, 0);
 
-    if (c->type == COMTYPE_BUILTIN) {
-        return exec_builtin(c);
-    }
+    /* pid = fork(); */
+    /* if (pid < 0) { */
+    /*     return run_error(ERR_FORK_ERROR); */
+    /* } */
 
-    pid = fork();
-    if (pid < 0) {
-        return run_error(ERR_FORK_ERROR);
-    }
+    /* if (pid == 0) { */
+    /*     exit(exec_standard(c)); */
+    /* } */
 
-    if (pid == 0) {
-        exit(exec_standard(c));
-    }
+    /* c->pid = pid; */
 
-    c->pid = pid;
+    /* if (!c->bg) { */
+    /*     waitpid(c->pid, 0, 0); */
 
-    if (!c->background) {
-        waitpid(c->pid, 0, 0);
-
-        err = comlist_pop(cl);
-        if (err) {
-            return run_error(err);
-        }
-    }
+    /*     err = comlist_pop(cl); */
+    /*     if (err) { */
+    /*         return run_error(err); */
+    /*     } */
+    /* } */
 
     return ERR_SUCCESS;
 }
@@ -831,8 +901,10 @@ int run(char *input, comlist *cl) {
 int main() {
     char *prompt, *input;
     comlist cl;
+    pipeline p;
 
     comlist_init(&cl);
+    pipeline_init(&p);
 
     while (1) {
         prompt = "jsh> ";
@@ -841,7 +913,7 @@ int main() {
         if (input && strlen(input) > 0) {
             add_history(input);
 
-            run(input, &cl);
+            run(input, &cl, &p);
         }
 
         /* Exit on ^D */
