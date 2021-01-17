@@ -1,8 +1,5 @@
-# makefile
-
-OS = $(shell uname)
-cflags := -std=c90 -Wall -Werror -g -w
-lflags := -lreadline
+cflags := -std=c89 -Wall -Wextra -Werror -g
+lflags :=
 exe := smash
 
 $(exe): smash.c
