@@ -3,7 +3,8 @@
  * Author: AJ Bond
  * Date: 01/17/2021
  *
- * Notes: SMASH, a STudent MAde SHell, is a basic unix shell written in C89 that
+ * Notes:
+ * SMASH, a STudent MAde SHell, is a basic unix shell written in C89 that
  * supports pipes, input and output redirection, and background processes.
  */
 
@@ -375,6 +376,7 @@ void exec_cd(com_t *c) {
     if (c->argc > 1 && chdir(c->argv[1]) == -1) {
         perror("cd");
     }
+    free_command(c);
 }
 
 void exec_exit(com_t *c) {
@@ -384,6 +386,15 @@ void exec_exit(com_t *c) {
     }
     free_command(c);
     exit(status);
+}
+
+void exec_jobs(com_t *c) {
+    int i;
+    for (i = 0; i < shell.jobp; ++i) {
+        printf("[%d]  %c running    ", i + 1, i == shell.jobp - 1 ? '+' : '-');
+        print_command(shell.jobs[i]);
+    }
+    free_command(c);
 }
 
 void redirect_input(com_t *c) {
@@ -536,6 +547,8 @@ void exec(com_t *c) {
         exec_cd(c);
     } else if (strcmp(c->argv[0], "exit") == 0) {
         exec_exit(c);
+    } else if (strcmp(c->argv[0], "jobs") == 0) {
+        exec_jobs(c);
     } else {
         exec_pipeline(c);
     }
