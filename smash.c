@@ -1,7 +1,7 @@
 /* smash.c
  *
  * Author: AJ Bond
- * Date: 01/17/2021
+ * Date: 01/14/2021
  *
  * Notes:
  * SMASH, a STudent MAde SHell, is a basic unix shell written in C89 that
@@ -107,6 +107,7 @@ void print_spaces(int n) {
     }
 }
 
+#ifdef DEBUG
 void command_debug_recursive(com_t *c, int num_spaces, int indent_width) {
     int i;
 
@@ -167,6 +168,7 @@ void command_debug(com_t *c) {
     command_debug_recursive(c, 0, 4);
     printf("\n");
 }
+#endif
 
 struct {
     int is_eof, is_pipe, jobp;
@@ -275,10 +277,17 @@ void error(char *fmt, ...) {
     va_end(ap);
 }
 
-com_t *command(FILE *in, tok_t *curtok) {
+int isdelim_token(tok_t *t) {
+    return t->type == TK_NWLN || t->type == TK_SEMI;
+}
+
+com_t *directive(FILE *in, tok_t *curtok) {
     com_t *c;
 
-    if ((curtok->type == TK_NWLN && !shell.is_pipe) || shell.is_eof) {
+    if ((isdelim_token(curtok) && !shell.is_pipe) || shell.is_eof) {
+        if (curtok->type == TK_SEMI) {
+            next_tok(in);
+        }
         return NULL;
     } else if (curtok->type == TK_NWLN && shell.is_pipe) {
         printf("pipe> ");
@@ -308,7 +317,7 @@ com_t *command(FILE *in, tok_t *curtok) {
 }
 
 com_t *redirection(FILE *in, tok_t *curtok) {
-    com_t *c = command(in, curtok);
+    com_t *c = directive(in, curtok);
 
     if (curtok->type == TK_LT) {
         *curtok = next_tok(in);
@@ -350,11 +359,6 @@ com_t *pipeline(FILE *in, tok_t *curtok) {
 
     shell.is_pipe = 0;
 
-    if (curtok->type == TK_AMP) {
-        c->bg = 1;
-        *curtok = next_tok(in);
-    }
-
     return c;
 }
 
@@ -362,8 +366,12 @@ com_t *parse(FILE *in) {
     tok_t curtok = next_tok(in);
     com_t *c = pipeline(in, &curtok);
 
-    if (curtok.type != TK_SEMI && curtok.type != TK_NWLN &&
-        curtok.type != TK_EOF) {
+    if (curtok.type == TK_AMP) {
+        c->bg = 1;
+    }
+
+    if (curtok.type != TK_AMP && curtok.type != TK_SEMI &&
+        curtok.type != TK_NWLN && curtok.type != TK_EOF) {
         error("unexpected token, expected delimeter");
         return NULL;
     }
@@ -458,7 +466,7 @@ void exec_pipeline(com_t *c) {
             }
         }
 
-        /* If p isn't last, make a new pipe for the next command. */
+        /* If p isn't last, make a new pipe for the next directive. */
         if (p->next) {
             if (pipe(pipefd) != 0) {
                 perror("exec_pipeline: pipe");
@@ -513,7 +521,7 @@ void exec_pipeline(com_t *c) {
         return;
     }
 
-    /* Add command to jobs list or immediately reap. */
+    /* Add directive to jobs list or immediately reap. */
     if (c->bg) {
         shell.jobs[shell.jobp++] = c;
         printf("[%d]", shell.jobp);
@@ -579,7 +587,7 @@ void reap_jobs(void) {
 
             /* Remove job from array. */
             int j;
-            for (j = i; j < shell.jobp - 2; ++j) {
+            for (j = i; j < shell.jobp - 1; ++j) {
                 shell.jobs[j] = shell.jobs[j + 1];
             }
             --shell.jobp;
@@ -595,15 +603,21 @@ void print_prompt(void) {
 
 int main(void) {
     FILE *in = stdin;
-    com_t *c;
 
     init_shell();
 
     while (!shell.is_eof) {
         reap_jobs();
         print_prompt();
-        c = parse(in);
-        exec(c);
+#ifdef DEBUG
+        {
+            com_t *c = parse(in);
+            command_debug(c);
+            exec(c);
+        }
+#else
+        exec(parse(in));
+#endif
     }
 
     return 0;

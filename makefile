@@ -5,6 +5,9 @@ exe := smash
 $(exe): smash.c
 	$(CC) $(cflags) $^ -o $(exe) $(lflags)
 
+debug: smash.c
+	$(CC) $(cflags) -DDEBUG $^ -o $(exe) $(lflags)
+
 .PHONY: clean
 
 clean:
