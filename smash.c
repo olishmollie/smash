@@ -204,7 +204,6 @@ tok_t eof(void) {
 }
 
 tok_t symbol(FILE *in, int c, char *lexeme, int pos);
->>>>>>> rewrite
 
 tok_t quote(FILE *in, int c, char *lexeme, int pos) {
     int delim = c;
