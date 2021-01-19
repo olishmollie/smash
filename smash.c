@@ -4,8 +4,9 @@
  * Date: 01/14/2021
  *
  * Notes:
- * SMASH, a STudent MAde SHell, is a basic unix shell written in C89 that
- * supports pipes, input and output redirection, and background processes.
+ * SMASH, a Student MAde SHell, is a basic unix shell written in C89. It
+ * supports file system navigation, pipes, input and output redirection, and
+ * background processes.
  */
 
 #include <errno.h>
