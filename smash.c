@@ -1,764 +1,615 @@
-#include <ctype.h>
+/* smash.c
+ *
+ * Author: AJ Bond
+ * Date: 01/14/2021
+ *
+ * Notes:
+ * SMASH, a STudent MAde SHell, is a basic unix shell written in C89 that
+ * supports pipes, input and output redirection, and background processes.
+ */
+
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/fcntl.h>
 #include <sys/param.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
-#include <readline/history.h>
-#include <readline/readline.h>
+#define MAXARGS 64
+#define MAXJOBS 256
 
-#define EOS '\0'
-#define MAXCHAR 1024
-#define MAXARGS 1024
+void panic(char *msg) {
+    fprintf(stderr, "%s\n", msg);
+    exit(1);
+}
 
-/* Charbuf stores the characters used in token charbuf. */
-char charbuf[MAXCHAR];
-
-/* OLDPWD stores the previously visited directory . */
-char OLDPWD[MAXPATHLEN];
-
-typedef enum error {
-    ERR_SUCCESS,
-    ERR_UNEXPECTED_CHAR,
-    ERR_UNEXPECTED_TOKEN,
-    ERR_TOO_MANY_ARGS,
-    ERR_SYMBOL_TABLE_OVERFLOW
-} error;
-
-typedef struct token {
+typedef struct tok_s {
     enum {
-        TOKTYPE_EOF,
-        TOKTYPE_DLR,
-        TOKTYPE_LPAREN,
-        TOKTYPE_RPAREN,
-        TOKTYPE_LBRACE,
-        TOKTYPE_RBRACE,
-        TOKTYPE_LBRACK,
-        TOKTYPE_RBRACK,
-        TOKTYPE_DQT,
-        TOKTYPE_TILDE,
-        TOKTYPE_DOT,
-        TOKTYPE_DDOT,
-        TOKTYPE_BANG,
-        TOKTYPE_STAR,
-        TOKTYPE_AMP,
-        TOKTYPE_PIPE,
-        TOKTYPE_GT,
-        TOKTYPE_LT,
-        TOKTYPE_DLRPAR,
-        TOKTYPE_SYM,
-        TOKTYPE_SQSTR,
+        TK_EOF = EOF,
+        TK_AMP = '&',
+        TK_PIPE = '|',
+        TK_DLR = '$',
+        TK_GT = '>',
+        TK_LT = '<',
+        TK_SEMI = ';',
+        TK_NWLN = '\n',
+        TK_SYM = 256,
     } type;
     char *lexeme;
-    unsigned int row, col, size;
-} token;
+    int size;
+} tok_t;
 
-/* Global tokens */
-token tok_dlr;
-token tok_lparen;
-token tok_rparen;
-token tok_lbrace;
-token tok_rbrace;
-token tok_lbrack;
-token tok_rbrack;
-token tok_dqt;
-token tok_bang;
-token tok_star;
-token tok_amp;
-token tok_pipe;
-token tok_gt;
-token tok_lt;
-token tok_tilde;
-token tok_dot;
-token tok_ddot;
-token tok_dlrpar;
-token tok_eof;
-token tok_for;
+tok_t mk_token(int type, char *lexeme, int size) {
+    tok_t t;
 
-char *toknames[] = {"TOKTYPE_EOF",    "TOKTYPE_DLR",    "TOKTYPE_LPAREN",
-                    "TOKTYPE_RPAREN", "TOKTYPE_LBRACE", "TOKTYPE_RBRACE",
-                    "TOKTYPE_LBRACK", "TOKTYPE_RBRACK", "TOKTYPE_DQT",
-                    "TOKTYPE_TILDE",  "TOKTYPE_DOT",    "TOKTYPE_DDOT",
-                    "TOKTYPE_BANG",   "TOKTYPE_STAR",   "TOKTYPE_AMP",
-                    "TOKTYPE_PIPE",   "TOKTYPE_GT",     "TOKTYPE_LT",
-                    "TOKTYPE_DLRPAR", "TOKTYPE_SYM",    "TOKTYPE_SQSTR"};
+    t.type = type;
 
-void token_debug(token *tok) {
-    char *name = toknames[tok->type];
-    printf("{ type: %s, lexeme: '%s' }\n", name, tok->lexeme);
-}
-
-/**
- * Tokstream represents the state of the lexer. It stores the input to be
- * parsed, a char buffer for lexemes, and its current position.
- */
-typedef struct tokstream {
-    struct {
-        char *charbuf;
-        unsigned int pos;
-    } symtable;
-    char *input;
-    unsigned int start, end;
-} tokstream;
-
-int is_space(unsigned int c) {
-    switch (c) {
-    case ' ':
-    case '\t':
-    case '\v':
-    case '\n':
-        return 1;
-    }
-    return 0;
-}
-
-// TODO: -- Just look up the ascii codes why dontcha?
-int is_symbol_char(unsigned int c) {
-    switch (toupper(c)) {
-    case '1':
-    case '2':
-    case '3':
-    case '4':
-    case '5':
-    case '6':
-    case '7':
-    case '8':
-    case '9':
-    case '0':
-    case 'A':
-    case 'B':
-    case 'C':
-    case 'D':
-    case 'E':
-    case 'F':
-    case 'G':
-    case 'H':
-    case 'I':
-    case 'J':
-    case 'K':
-    case 'L':
-    case 'M':
-    case 'N':
-    case 'O':
-    case 'P':
-    case 'Q':
-    case 'R':
-    case 'S':
-    case 'T':
-    case 'U':
-    case 'V':
-    case 'W':
-    case 'X':
-    case 'Y':
-    case 'Z':
-    case '.':
-    case '/':
-    case '-':
-    case '~':
-        return 1;
-    }
-    return 0;
-}
-
-int char_isdelim(unsigned int c) {
-    if (is_space(c)) {
-        return 1;
-    }
-
-    return c == EOS || c == '$' || c == '&' || c == '|' || c == '<' ||
-           c == '>' || c == '(' || c == ')' || c == '"' || c == '{';
-}
-
-int tokstream_eof(tokstream *ts) {
-    return ts->end >= strlen(ts->input);
-}
-
-int peek(tokstream *ts) {
-    return ts->input[ts->end];
-}
-
-int next(tokstream *ts) {
-    return ts->input[ts->end++];
-}
-
-int ignore(tokstream *ts) {
-    ts->start = ++ts->end;
-    return ts->input[ts->end];
-}
-
-int backup(tokstream *ts) {
-    return ts->input[--ts->end];
-}
-
-int tokstream_error(tokstream *ts, int err) {
-    int c = ts->input[ts->end];
-
-    switch (err) {
-    case ERR_UNEXPECTED_CHAR:
-        fprintf(stderr, "read error: unexpected token '%c%s'\n", c,
-                c ? "" : "EOF");
-        break;
-    case ERR_SYMBOL_TABLE_OVERFLOW:
-        fprintf(stderr, "read error: symbol table overflow\n");
-        break;
-    default:
-        fprintf(stderr, "read error: unknown error code %d\n", err);
-    }
-
-    return err;
-}
-
-/**
- * Add `lexeme` to the symbol table and populate `tok` size, lexeme
- * (a pointer into the symbol table), and type. If overflow occurs, return
- * an error code and set tok->lexeme to NULL.
- */
-int token_init(tokstream *ts, token *tok, int type, char *lexeme, int len) {
-    tok->lexeme = ts->symtable.charbuf + ts->symtable.pos;
-    tok->size = len;
-    tok->type = type;
-
-    for (int i = 0; i < len; ++i) {
-        if (ts->symtable.pos >= MAXCHAR) {
-            tok->lexeme = NULL;
-            return tokstream_error(ts, ERR_SYMBOL_TABLE_OVERFLOW);
+    if (t.type == TK_SYM) {
+        if (!(t.lexeme = malloc(size + 1))) {
+            panic("mk_tok: out of memory");
         }
-
-        ts->symtable.charbuf[ts->symtable.pos++] = *lexeme++;
+        strcpy(t.lexeme, lexeme);
+    } else {
+        t.lexeme = NULL;
     }
 
-    ts->symtable.charbuf[ts->symtable.pos++] = '\0';
+    t.size = size;
 
-    return ERR_SUCCESS;
+    return t;
 }
 
-/**
- * Initialize a tokstream's symbol table with keywords and
- * symbols, give it an input to parse, and reset the state of the lexer.
- */
-int tokstream_init(tokstream *ts, char *input) {
+typedef struct com_s {
+    int bg, argc;
+    pid_t pid;
+    char *infile, *outfile;
+    char *argv[MAXARGS];
 
-    ts->symtable.charbuf = charbuf;
-    ts->symtable.pos = 0;
+    struct com_s *next;
+} com_t;
 
-    /*
-     * NOTE: -- We don't check for errors here because the only error token_init
-     * can return is due to overflow. As long as MAXCHAR is defined as greater
-     * than the number of preallocated tokens, it shouldn't pose a problem.
-     */
-    token_init(ts, &tok_dlr, TOKTYPE_DLR, "$", 1);
-    token_init(ts, &tok_lparen, TOKTYPE_LPAREN, "(", 1);
-    token_init(ts, &tok_rparen, TOKTYPE_RPAREN, ")", 1);
-    token_init(ts, &tok_lbrace, TOKTYPE_LBRACE, "{", 1);
-    token_init(ts, &tok_rbrace, TOKTYPE_RBRACE, "}", 1);
-    token_init(ts, &tok_lbrack, TOKTYPE_LBRACK, "[", 1);
-    token_init(ts, &tok_rbrack, TOKTYPE_RBRACK, "]", 1);
-    token_init(ts, &tok_dqt, TOKTYPE_DQT, "\"", 1);
-    token_init(ts, &tok_bang, TOKTYPE_BANG, "!", 1);
-    token_init(ts, &tok_star, TOKTYPE_STAR, "*", 1);
-    token_init(ts, &tok_amp, TOKTYPE_AMP, "&", 1);
-    token_init(ts, &tok_pipe, TOKTYPE_PIPE, "|", 1);
-    token_init(ts, &tok_gt, TOKTYPE_GT, ">", 1);
-    token_init(ts, &tok_lt, TOKTYPE_LT, "<", 1);
-    token_init(ts, &tok_dlrpar, TOKTYPE_DLRPAR, "$(", 2);
-    token_init(ts, &tok_eof, TOKTYPE_EOF, "EOF", 3);
-
-    ts->start = 0;
-    ts->end = 0;
-    ts->input = input;
-
-    return ERR_SUCCESS;
-}
-
-/**
- * Parse ts's input and assigns tok to the next token in the
- * stream.
- */
-int tokstream_next(tokstream *ts, token *tok) {
-    char c = peek(ts);
-
-    while (!tokstream_eof(ts) && is_space(c)) {
-        c = ignore(ts);
+com_t *new_command(void) {
+    com_t *c;
+    if (!(c = malloc(sizeof(com_t)))) {
+        panic("new_command: out of memory");
     }
-
-    if (is_symbol_char(c)) {
-        while (!char_isdelim(c)) {
-            c = next(ts);
-        }
-        backup(ts);
-
-        return token_init(ts, tok, TOKTYPE_SYM, ts->input + ts->start,
-                          ts->end - ts->start);
-    }
-
-    int err = ERR_SUCCESS;
-    switch (c) {
-    case '\'':
-        c = ignore(ts);
-
-        while (c && c != '\'') {
-            c = next(ts);
-        }
-        backup(ts);
-
-        if (c != '\'') {
-            err = tokstream_error(ts, ERR_UNEXPECTED_CHAR);
-            break;
-        }
-
-        err = token_init(ts, tok, TOKTYPE_SQSTR, ts->input + ts->start,
-                         ts->end - ts->start);
-
-        /* Ignore the closing quote. */
-        ignore(ts);
-
-        break;
-    case '"':
-        *tok = tok_dqt;
-        ignore(ts);
-        break;
-    case '(':
-        *tok = tok_lparen;
-        ignore(ts);
-        break;
-    case ')':
-        *tok = tok_rparen;
-        ignore(ts);
-        break;
-    case '<':
-        *tok = tok_lt;
-        ignore(ts);
-        break;
-    case '>':
-        *tok = tok_gt;
-        ignore(ts);
-        break;
-    case '|':
-        *tok = tok_pipe;
-        ignore(ts);
-        break;
-    case '&':
-        *tok = tok_amp;
-        ignore(ts);
-        break;
-    case '!':
-        *tok = tok_bang;
-        ignore(ts);
-        break;
-    case '*':
-        *tok = tok_star;
-        ignore(ts);
-        break;
-    case '{':
-        *tok = tok_lbrace;
-        ignore(ts);
-        break;
-    case '}':
-        *tok = tok_rbrace;
-        ignore(ts);
-        break;
-    case '[':
-        *tok = tok_lbrack;
-        ignore(ts);
-        break;
-    case ']':
-        *tok = tok_rbrack;
-        ignore(ts);
-        break;
-    case '~':
-        *tok = tok_tilde;
-        ignore(ts);
-        break;
-    case '.':
-        ignore(ts);
-
-        if (peek(ts) == '.') {
-            *tok = tok_ddot;
-            ignore(ts);
-        } else {
-            *tok = tok_dot;
-        }
-
-        break;
-    case '$':
-        ignore(ts);
-
-        if (peek(ts) == '(') {
-            *tok = tok_dlrpar;
-
-            ignore(ts);
-        } else {
-            *tok = tok_dlr;
-        }
-
-        break;
-    case EOS:
-    case EOF:
-        *tok = tok_eof;
-        break;
-    default:
-        err = tokstream_error(ts, ERR_UNEXPECTED_CHAR);
-    }
-
-    return err;
-}
-
-/**
- * Command represents a shell directive. It stores a directive's pid, argument
- * list, any redirection information, and whether the process is to be executed
- * in the background.
- */
-typedef struct command {
-    int background;
-    unsigned int pid;
-
-    enum { COMTYPE_STANDARD, COMTYPE_BUILTIN, COMTYPE_PIPE } type;
-
-    char *in, *out;
-
-    unsigned int argc;
-    char *argv[MAXCHAR];
-} command;
-
-int command_init(command *c, int type) {
-    c->type = type;
-    c->in = NULL;
-    c->out = NULL;
-    c->argc = 0;
-    c->background = 0;
+    c->bg = c->argc = 0;
     c->pid = 0;
-    return ERR_SUCCESS;
+    c->infile = c->outfile = NULL;
+    c->next = NULL;
+    return c;
 }
 
-char *builtins[] = {"cd", "exit"};
-unsigned int nbuiltins = sizeof(builtins) / sizeof(builtins[0]);
-
-int is_builtin(char *sym) {
-    for (unsigned int i = 0; i < nbuiltins; ++i) {
-        if (strcmp(sym, builtins[i]) == 0) {
-            return 1;
-        }
+void free_command(com_t *c) {
+    int i;
+    free(c->infile);
+    free(c->outfile);
+    for (i = 0; i < c->argc; ++i) {
+        free(c->argv[i]);
     }
-    return 0;
+    free(c);
 }
 
-int tok_isdelim(token *tok) {
-    return tok->type == TOKTYPE_DLR || tok->type == TOKTYPE_DLRPAR ||
-           tok->type == TOKTYPE_GT || tok->type == TOKTYPE_LT ||
-           tok->type == TOKTYPE_AMP || tok->type == TOKTYPE_EOF;
+void print_command(com_t *c) {
+    int i;
+    printf("%s", c->argv[0]);
+    for (i = 1; i < c->argc; ++i) {
+        printf(" %s", c->argv[i]);
+    }
+    printf("\n");
 }
 
-int parse_error(token *tok, int err) {
-    switch (err) {
-    case ERR_UNEXPECTED_TOKEN:
-        fprintf(stderr, "parse error: unexpected token '%s'\n", tok->lexeme);
-        break;
-    case ERR_TOO_MANY_ARGS:
-        fprintf(stderr, "parse error: too many arguments\n");
-        break;
-    /* These two are handled by the tokstream. */
-    case ERR_SYMBOL_TABLE_OVERFLOW:
-    case ERR_UNEXPECTED_CHAR:
-        break;
-    default:
-        fprintf(stderr, "parse error: unknown error code %d\n", err);
-    }
-
-    return err;
-}
-
-int expect(tokstream *ts, token *tok, int toktype) {
-    int err = tokstream_next(ts, tok);
-    if (tok->type != toktype) {
-        return ERR_UNEXPECTED_TOKEN;
-    }
-
-    return err;
-}
-
-int parse_redirects(command *c, tokstream *ts, token *tok) {
-    int err = ERR_SUCCESS;
-
-    while (tok->type == TOKTYPE_LT || tok->type == TOKTYPE_GT) {
-        if (tok->type == TOKTYPE_LT) {
-            err = expect(ts, tok, TOKTYPE_SYM);
-            if (err != ERR_SUCCESS) {
-                return err;
-            }
-
-            c->in = tok->lexeme;
-        } else {
-            err = expect(ts, tok, TOKTYPE_SYM);
-            if (err != ERR_SUCCESS) {
-                return err;
-            }
-
-            c->out = tok->lexeme;
-        }
-
-        err = tokstream_next(ts, tok);
-        if (err != ERR_SUCCESS) {
-            return err;
-        }
-    }
-
-    return err;
-}
-
-int parse_command(command *c, tokstream *ts, token *tok) {
-    int err;
-
-    err = command_init(c, COMTYPE_STANDARD);
-    if (err) {
-        return err;
-    }
-
-    err = tokstream_next(ts, tok);
-    if (err) {
-        return err;
-    }
-
-    if (is_builtin(tok->lexeme)) {
-        c->type = COMTYPE_BUILTIN;
-    }
-
-    c->argv[c->argc++] = tok->lexeme;
-
-    while ((err = tokstream_next(ts, tok)) == 0 && !tok_isdelim(tok)) {
-        if (c->argc >= MAXARGS) {
-            return ERR_TOO_MANY_ARGS;
-        }
-
-        c->argv[c->argc++] = tok->lexeme;
-    }
-
-    if (err != 0) {
-        return err;
-    }
-
-    c->argv[c->argc] = (char *)NULL;
-
-    return parse_redirects(c, ts, tok);
-}
-
-/**
- * Parse input into a command object. If something goes wrong, it
- * returns an error code. Otherwise, it returns ERR_SUCCESS.
- */
-int parse(command *c, char *input) {
-    tokstream ts;
-    token tok;
-    int err;
-
-    tokstream_init(&ts, input);
-
-    err = parse_command(c, &ts, &tok);
-    if (err) {
-        return parse_error(&tok, err);
-    }
-
-    if ((err = expect(&ts, &tok, TOKTYPE_EOF))) {
-        return parse_error(&tok, err);
-    }
-
-    return ERR_SUCCESS;
-}
-
-int exec_builtin(command *c) {
-    if (strcmp(c->argv[0], "exit") == 0) {
-        int arg = 0;
-        if (c->argc > 1) {
-            // NOTE: not checking for errors in atoi, it might blow up.
-            int arg = atoi(c->argv[1]);
-        }
-        exit(arg);
-    }
-
-    if (strcmp(c->argv[0], "cd") == 0) {
-        // Save OLDPWD into tmp var.
-        getcwd(OLDPWD, MAXPATHLEN);
-
-        // Switch directories.
-        if (c->argc > 1) {
-            if (strcmp(c->argv[1], "-") == 0) {
-                chdir(OLDPWD);
-            } else {
-                chdir(c->argv[1]);
-            }
-        } else {
-            chdir("$HOME");
-        }
-    }
-
-    if (strcmp(c->argv[0], "jobs") == 0) {
-        // TODO
-    }
-
-    return ERR_SUCCESS;
-}
-
-int exec_standard(command *c) {
-    if (c->in) {
-        // Open the destination file and rewire stdout.
-        int ifd = open(c->in, O_RDWR, 0644);
-
-        dup2(ifd, 0);
-        close(ifd);
-    }
-
-    if (c->out) {
-        // Open the source file and rewire stdin.
-        int ofd = open(c->out, O_RDWR | O_CREAT | O_TRUNC, 0644);
-
-        dup2(ofd, 1);
-        close(ofd);
-    }
-
-    if (execvp(c->argv[0], c->argv) == -1) {
-        fprintf(stderr, "%s: ", c->argv[0]);
-
-        switch (errno) {
-        case EPERM:
-            fprintf(stderr, "operation not permitted\n");
-            break;
-        case ENOENT:
-            fprintf(stderr, "no such file or directory\n");
-            break;
-        case EACCES:
-            fprintf(stderr, "permission denied\n");
-            break;
-        default:
-            fprintf(stderr, "unknown errno: %d\n", errno);
-        }
-    }
-
-    return errno;
-}
-
-void print_space(int n) {
-    for (int i = 0; i < n; ++i) {
+void print_spaces(int n) {
+    while (n-- > 0) {
         printf(" ");
     }
 }
 
-void command_debug(command *c, int space) {
-    print_space(space);
-    printf("Command {\n");
-
+#ifdef DEBUG
+void command_debug_recursive(com_t *c, int num_spaces, int indent_width) {
     int i;
-    switch (c->type) {
-    case COMTYPE_STANDARD:
-        print_space(space + 4);
-        printf("type: COMTYPE_STANDARD\n");
 
-        print_space(space + 4);
-        printf("name: %s\n", c->argv[0]);
-
-        print_space(space + 4);
-        printf("args: [");
-        for (i = 1; i < c->argc; ++i) {
-            printf("'%s'%s", c->argv[i], i != c->argc - 1 ? ", " : "");
-        }
-        printf("]\n");
-
-        print_space(space + 4);
-        printf("in: %s\n", c->in);
-
-        print_space(space + 4);
-        printf("out: %s\n", c->out);
-
-        print_space(space + 4);
-        printf("background: %s\n", c->background ? "true" : "false");
-
-        break;
-    case COMTYPE_BUILTIN:
-        print_space(space + 4);
-        printf("type: COMTYPE_BUILTIN\n");
-
-        print_space(space + 4);
-        printf("name: %s\n", c->argv[0]);
-
-        print_space(space + 4);
-        printf("args: [");
-        for (i = 1; i < c->argc; ++i) {
-            printf("'%s'%s", c->argv[i], i != c->argc - 1 ? ", " : "");
-        }
-        printf("]\n");
-
-        print_space(space + 4);
-        printf("in: %s\n", c->in);
-
-        print_space(space + 4);
-        printf("out: %s\n", c->out);
-
-        print_space(space + 4);
-        printf("background: %s\n", c->background ? "true" : "false");
-
-        break;
-    case COMTYPE_PIPE:
-        // TODO
-        break;
+    if (c == NULL) {
+        return;
     }
 
-    print_space(space);
-    printf("}\n");
+    printf("com_t {\n");
+
+    print_spaces(num_spaces + indent_width);
+    printf("pid: %d\n", c->pid);
+
+    print_spaces(num_spaces + indent_width);
+    printf("name: %s\n", c->argv[0]);
+
+    if (c->bg) {
+        print_spaces(num_spaces + indent_width);
+        printf("bg: true\n");
+    }
+
+    if (c->infile) {
+        print_spaces(num_spaces + indent_width);
+        printf("infile: %s\n", c->infile);
+    }
+
+    if (c->outfile) {
+        print_spaces(num_spaces + indent_width);
+        printf("outfile: %s\n", c->outfile);
+    }
+
+    print_spaces(num_spaces + indent_width);
+    printf("args: [");
+
+    for (i = 1; i < c->argc; ++i) {
+        printf("'%s'", c->argv[i]);
+        if (i != c->argc - 1) {
+            printf(", ");
+        }
+    }
+    printf("]\n");
+
+    if (c->next) {
+        print_spaces(num_spaces + indent_width);
+        printf("next: ");
+        command_debug_recursive(c->next, num_spaces + indent_width,
+                                indent_width);
+    }
+
+    print_spaces(num_spaces);
+    printf("}");
+
+    if (num_spaces) {
+        printf("\n");
+    }
 }
 
-int run(char *input) {
-    command c;
-    int err, pid;
-
-    err = parse(&c, input);
-    if (err != 0) {
-        return err;
-    }
-
-    if (c.type == COMTYPE_BUILTIN) {
-        return exec_builtin(&c);
-    }
-
-    pid = fork();
-    if (pid < 0) {
-        fprintf(stderr, "error forking process\n");
-        exit(1);
-    }
-
-    if (pid == 0) {
-        exit(exec_standard(&c));
-    }
-
-    c.pid = pid;
-    waitpid(c.pid, 0, 0);
-
-    return ERR_SUCCESS;
-}
-
-int main() {
-    char *prompt, *input;
-
-    while (1) {
-        prompt = "Smash $ ";
-        input = readline(prompt);
-
-        if (input && strlen(input) > 0) {
-            add_history(input);
-
-            run(input);
-        }
-
-        /* Exit on ^D */
-        if (input == NULL) {
-            break;
-        }
-
-        // Valgrind doesn't like using delete with the c malloc from readline.
-        free(input);
-    }
-
+void command_debug(com_t *c) {
+    command_debug_recursive(c, 0, 4);
     printf("\n");
+}
+#endif
+
+struct {
+    int is_eof, is_pipe, jobp;
+    com_t *jobs[MAXJOBS];
+} shell;
+
+void init_shell(void) { shell.is_eof = shell.is_pipe = shell.jobp = 0; }
+
+int fpeek(FILE *stream) {
+    int c = getc(stream);
+    ungetc(c, stream);
+    return c;
+}
+
+int isop(int c) { return c == '&' || c == '|' || c == '>' || c == '<'; }
+
+int isdelim(int c) { return c == '\n' || c == ';'; }
+
+int isspace(int c) { return c == ' ' || c == '\t' || c == '\v'; }
+
+tok_t comment(FILE *in) {
+    int c = fgetc(in);
+    while (c != '\n' && c != EOF) {
+        c = fgetc(in);
+    }
+    return mk_token(c, NULL, 1);
+}
+
+tok_t eof(void) {
+    shell.is_eof = 1;
+    return mk_token(TK_EOF, NULL, 1);
+}
+
+tok_t symbol(FILE *in, int c, char *lexeme, int pos);
+>>>>>>> rewrite
+
+tok_t quote(FILE *in, int c, char *lexeme, int pos) {
+    int delim = c;
+
+    while ((c = fgetc(in)) != delim) {
+        lexeme[pos++] = c;
+        if (c == '\n') {
+            printf("quote> ");
+        }
+    }
+
+    c = fpeek(in);
+    return symbol(in, c, lexeme, pos);
+}
+
+tok_t symbol(FILE *in, int c, char *lexeme, int pos) {
+    while (!isdelim(c) && !isspace(c) && !isop(c)) {
+        if (c == EOF) {
+            break;
+        } else if (c == '\'' || c == '"') {
+            return quote(in, fgetc(in), lexeme, pos);
+        } else {
+            lexeme[pos++] = fgetc(in);
+        }
+        c = fpeek(in);
+    }
+    lexeme[pos] = '\0';
+
+    return mk_token(TK_SYM, lexeme, strlen(lexeme));
+}
+
+tok_t start(FILE *in, char c) {
+    char lexeme[MAXPATHLEN];
+    int pos = 0;
+
+    while (isspace(c)) {
+        fgetc(in);
+        c = fpeek(in);
+    }
+
+    if (c == '#') {
+        return comment(in);
+    } else if (isdelim(c) || isop(c)) {
+        fgetc(in);
+        return mk_token(c, NULL, 1);
+    } else if (c == EOF) {
+        return eof();
+    } else {
+        return symbol(in, c, lexeme, pos);
+    }
+}
+
+tok_t next_tok(FILE *in) {
+    int c = fpeek(in);
+    shell.is_eof = 0;
+    return start(in, c);
+}
+
+void error(char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+}
+
+int isdelim_token(tok_t *t) { return t->type == TK_NWLN || t->type == TK_SEMI; }
+
+com_t *directive(FILE *in, tok_t *curtok) {
+    com_t *c;
+
+    if ((isdelim_token(curtok) && !shell.is_pipe) || shell.is_eof) {
+        if (curtok->type == TK_SEMI) {
+            next_tok(in);
+        }
+        return NULL;
+    } else if (curtok->type == TK_NWLN && shell.is_pipe) {
+        printf("pipe> ");
+        *curtok = next_tok(in);
+    }
+
+    if (curtok->type != TK_SYM) {
+        error("unexpected token '%c', expected symbol", (char)curtok->type);
+        return NULL;
+    }
+
+    c = new_command();
+    c->argv[c->argc++] = curtok->lexeme;
+
+    *curtok = next_tok(in);
+    while (curtok->type == TK_SYM) {
+        if (c->argc > MAXARGS) {
+            error("too many arguments");
+            return NULL;
+        }
+        c->argv[c->argc++] = curtok->lexeme;
+        *curtok = next_tok(in);
+    }
+    c->argv[c->argc] = NULL;
+
+    return c;
+}
+
+com_t *redirection(FILE *in, tok_t *curtok) {
+    com_t *c = directive(in, curtok);
+
+    if (curtok->type == TK_LT) {
+        *curtok = next_tok(in);
+
+        if (curtok->type != TK_SYM) {
+            error("unexpected token, expected symbol");
+            return NULL;
+        }
+
+        c->infile = curtok->lexeme;
+        *curtok = next_tok(in);
+    }
+
+    if (curtok->type == TK_GT) {
+        *curtok = next_tok(in);
+
+        if (curtok->type != TK_SYM) {
+            error("unexpected token, expected symbol");
+            return NULL;
+        }
+
+        c->outfile = curtok->lexeme;
+        *curtok = next_tok(in);
+    }
+
+    return c;
+}
+
+com_t *parse(FILE *in);
+
+com_t *pipeline(FILE *in, tok_t *curtok) {
+    com_t *c = redirection(in, curtok);
+
+    while (curtok->type == TK_PIPE) {
+        *curtok = next_tok(in);
+        shell.is_pipe = 1;
+        c->next = pipeline(in, curtok);
+    }
+
+    shell.is_pipe = 0;
+
+    return c;
+}
+
+com_t *parse(FILE *in) {
+    tok_t curtok = next_tok(in);
+    com_t *c = pipeline(in, &curtok);
+
+    if (curtok.type == TK_AMP) {
+        c->bg = 1;
+    }
+
+    if (curtok.type != TK_AMP && curtok.type != TK_SEMI &&
+        curtok.type != TK_NWLN && curtok.type != TK_EOF) {
+        error("unexpected token, expected delimeter");
+        return NULL;
+    }
+
+    return c;
+}
+
+void exec_cd(com_t *c) {
+    errno = 0;
+    if (c->argc > 1 && chdir(c->argv[1]) == -1) {
+        perror("cd");
+    }
+    free_command(c);
+}
+
+void exec_exit(com_t *c) {
+    int status = 0;
+    if (c->argc > 1) {
+        status = atoi(c->argv[1]);
+    }
+    free_command(c);
+    exit(status);
+}
+
+void exec_jobs(com_t *c) {
+    int i;
+    for (i = 0; i < shell.jobp; ++i) {
+        printf("[%d]  %c running    ", i + 1, i == shell.jobp - 1 ? '+' : '-');
+        print_command(shell.jobs[i]);
+    }
+    free_command(c);
+}
+
+void redirect_input(com_t *c) {
+    int fdin;
+
+    errno = 0;
+    if ((fdin = open(c->infile, O_RDONLY)) == -1) {
+        perror("redirect_input: open");
+        return;
+    }
+
+    if (dup2(fdin, STDIN_FILENO) == -1) {
+        perror("redirect_input: dup2");
+        return;
+    }
+
+    close(fdin);
+}
+
+void redirect_output(com_t *c) {
+    int fdout;
+
+    errno = 0;
+    if ((fdout = open(c->outfile, O_RDWR | O_CREAT | O_TRUNC, 0644)) == -1) {
+        perror("redirect_output: open");
+        return;
+    }
+
+    if (dup2(fdout, STDOUT_FILENO) == -1) {
+        perror("redirect_output: dup2");
+        return;
+    }
+
+    close(fdout);
+}
+
+void exec_pipeline(com_t *c) {
+    int pipefd[2], stdin_cpy;
+    com_t *p = c;
+
+    stdin_cpy = dup(STDIN_FILENO);
+
+    while (p) {
+        errno = 0;
+
+        /* If p isn't first, attach stdin to the pipe. */
+        if (p != c) {
+            if (dup2(pipefd[0], STDIN_FILENO) == -1) {
+                perror("exec_pipeline: dup2");
+                return;
+            }
+
+            if (close(pipefd[0])) {
+                perror("exec_pipeline: close");
+                return;
+            }
+
+            if (close(pipefd[1])) {
+                perror("exec_pipeline: close");
+                return;
+            }
+        }
+
+        /* If p isn't last, make a new pipe for the next directive. */
+        if (p->next) {
+            if (pipe(pipefd) != 0) {
+                perror("exec_pipeline: pipe");
+                return;
+            }
+        }
+
+        if ((p->pid = fork()) == -1) {
+            perror("exec_pipeline: fork");
+            return;
+        }
+
+        if (p->pid == 0) {
+            /* If p isn't last, attach stdout to the pipe. */
+            if (p->next) {
+                if (dup2(pipefd[1], STDOUT_FILENO) == -1) {
+                    perror("exec_pipeline: dup2");
+                    exit(1);
+                }
+
+                if (close(pipefd[0])) {
+                    perror("exec_pipeline: close");
+                    exit(1);
+                }
+
+                if (close(pipefd[1])) {
+                    perror("exec_pipeline: close");
+                    exit(1);
+                }
+            }
+
+            if (p->infile) {
+                redirect_input(p);
+            }
+
+            if (p->outfile) {
+                redirect_output(p);
+            }
+
+            if (execvp(p->argv[0], p->argv) == -1) {
+                perror("exec_pipeline: exec");
+                exit(1);
+            }
+        }
+
+        p = p->next;
+    }
+
+    /* Restore stdin. */
+    if (dup2(stdin_cpy, STDIN_FILENO) == -1) {
+        perror("exec_pipeline: dup2");
+        return;
+    }
+
+    /* Add directive to jobs list or immediately reap. */
+    if (c->bg) {
+        shell.jobs[shell.jobp++] = c;
+        printf("[%d]", shell.jobp);
+
+        while (c) {
+            printf(" %d", c->pid);
+            c = c->next;
+        }
+
+        printf("\n");
+    } else {
+        while (c) {
+            if (waitpid(c->pid, NULL, 0) == -1) {
+                perror("exec_pipeline: waitpid");
+                return;
+            }
+
+            p = c->next;
+            free_command(c);
+            c = p;
+        }
+    }
+}
+
+void exec(com_t *c) {
+    if (!c) {
+        return;
+    }
+
+    if (strcmp(c->argv[0], "cd") == 0) {
+        exec_cd(c);
+    } else if (strcmp(c->argv[0], "exit") == 0) {
+        exec_exit(c);
+    } else if (strcmp(c->argv[0], "jobs") == 0) {
+        exec_jobs(c);
+    } else {
+        exec_pipeline(c);
+    }
+}
+
+void reap_jobs(void) {
+    com_t *c, *p;
+    int i, status;
+    for (i = 0; i < shell.jobp; ++i) {
+        c = shell.jobs[i];
+
+        errno = 0;
+        if ((status = waitpid(shell.jobs[i]->pid, NULL, WNOHANG))) {
+            if (status == -1) {
+                perror("reap_jobs");
+            }
+
+            /* Reap all jobs in pipeline. */
+            while (c) {
+                printf("[%d] %d done\t", i + 1, c->pid);
+                print_command(c);
+                printf("\n");
+
+                p = c->next;
+                free_command(c);
+                c = p;
+            }
+
+            /* Remove job from array. */
+            int j;
+            for (j = i; j < shell.jobp - 1; ++j) {
+                shell.jobs[j] = shell.jobs[j + 1];
+            }
+            --shell.jobp;
+        }
+    }
+}
+
+void print_prompt(void) {
+    char *cwd = getcwd(NULL, 0);
+    printf("%s smash> ", cwd);
+    free(cwd);
+}
+
+int main(void) {
+    FILE *in = stdin;
+
+    init_shell();
+
+    while (!shell.is_eof) {
+        reap_jobs();
+        print_prompt();
+#ifdef DEBUG
+        {
+            com_t *c = parse(in);
+            command_debug(c);
+            exec(c);
+        }
+#else
+        exec(parse(in));
+#endif
+    }
 
     return 0;
 }
