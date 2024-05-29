@@ -1,4 +1,4 @@
-cflags := -std=c89 -Wall -Wextra -Werror -g
+cflags := -std=c89 -Wall -Wextra -Werror -Wpedantic -g
 lflags :=
 exe := smash
 
