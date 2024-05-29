@@ -37,7 +37,7 @@ typedef struct tok_s {
         TK_LT = '<',
         TK_SEMI = ';',
         TK_NWLN = '\n',
-        TK_SYM = 256,
+        TK_SYM = 256
     } type;
     char *lexeme;
     int size;
@@ -555,7 +555,7 @@ void exec(com_t *c) {
 
 void reap_jobs(void) {
     com_t *c, *p;
-    int i, status;
+    int i, j, status;
     for (i = 0; i < shell.jobp; ++i) {
         c = shell.jobs[i];
 
@@ -577,7 +577,6 @@ void reap_jobs(void) {
             }
 
             /* Remove job from array. */
-            int j;
             for (j = i; j < shell.jobp - 1; ++j) {
                 shell.jobs[j] = shell.jobs[j + 1];
             }
